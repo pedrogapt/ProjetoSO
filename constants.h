@@ -8,3 +8,9 @@
 #define MAX_RESERVATIONS       256
 #define MAX_RESERVATIONS_ITEMS 32
 #define MAX_RESERVATION_VMS    128
+
+#ifndef STUDENT_ID
+#define STUDENT_ID             "117598"
+#endif
+
+#define CLOUDIST_TMP_DIR       "/tmp/CloudIST-" STUDENT_ID

@@ -1,6 +1,7 @@
 #ifndef DATACENTER__H
 #define DATACENTER__H
 
+#include <pthread.h>
 #include <stdio.h>
 #include <sys/types.h>
 
@@ -25,6 +26,8 @@ typedef struct Server Server;
 
 typedef struct VM {
   char id[MAX_VM_ID_STRING]; // VM id. eg: "R1_V1_1"
+  char dir_path[MAX_PATH_SIZE]; // Working directory for the VM
+  int cpu_limit;  // CPU percentage limit for cpulimit
   VMType *type;   // VM type.
   Server *server; // Server where the VM is placed.
   pid_t pid;      // PID of executable file.
@@ -38,6 +41,7 @@ typedef struct Server {
 
 	VM *hosted_vms[MAX_HOSTED_VMS];
     size_t num_hosted_vms;
+    pthread_mutex_t lock;
 } Server;
 
 typedef enum {
@@ -68,12 +72,23 @@ typedef struct Reservation {
 typedef struct DataCenter {
 	Server *servers;			     // List of Servers.
 	size_t num_servers;              // Number of Servers.
+	size_t host_cores;               // Number of host CPU cores used in simulation.
 
 	VMType vm_types[MAX_VM_TYPES];
     size_t num_vm_types;
 
 	Reservation reservations[MAX_RESERVATIONS];
     size_t num_reservations;
+
+	pthread_rwlock_t vm_types_lock;
+	pthread_mutex_t reservations_lock;
+
+	pthread_t reaper_thread;
+	pthread_mutex_t reaper_lock;
+	pthread_cond_t reaper_cond;
+	size_t active_vms;
+	int shutting_down;
+	int reaper_started;
 
 	int configured;		      // Wheter the datacenter is configured or not.
 } DataCenter;
@@ -84,6 +99,14 @@ typedef struct DataCenter {
  * @param dc DataCenter being initialized.
  */
 void datacenter_init(DataCenter *dc);
+
+/**
+ * Sets the number of host CPU cores used by the simulation.
+ *
+ * @param dc Pointer to DataCenter.
+ * @param host_cores Number of host CPU cores.
+ */
+void datacenter_set_host_cores(DataCenter *dc, size_t host_cores);
 
 /**
  * Destroys a Data Center.
@@ -102,6 +125,7 @@ void datacenter_destroy(DataCenter *dc);
  * @return 1 on error.
  */
 int datacenter_configure(DataCenter *dc, size_t num_pcs, Resources *resources);
+
 
 /**
  * Defines a VM for the Data Center

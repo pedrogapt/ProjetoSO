@@ -118,4 +118,30 @@ const char *vm_state_to_string(VMState state);
  */
 const char *res_state_to_string(ReservationState state);
 
+/**
+ * Checks if a reservation with the given id already exists in the Data Center.
+ *
+ * @param dc Pointer to Data Center.
+ * @param reservation_id Id of the reservation being checked.
+ *
+ * @return 1 if the reservation exists, 0 otherwise.
+ */
+int reservation_exists(DataCenter *dc, const char *reservation_id);
+
+/**
+ * Reaps a single terminated VM process by PID, returning its resources to its
+ * host server and removing the reservation if all of its VMs have terminated.
+ *
+ * @param dc Pointer to Data Center.
+ * @param pid PID of the terminated VM process.
+ */
+void reap_vm_by_pid(DataCenter *dc, pid_t pid);
+
+/**
+ * Non-blockingly reaps any terminated child VM processes (WNOHANG).
+ *
+ * @param dc Pointer to Data Center.
+ */
+void reap_finished_vms_nonblocking(DataCenter *dc);
+
 #endif // DATACENTER_UTILS__H

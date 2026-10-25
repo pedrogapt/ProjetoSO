@@ -1,5 +1,6 @@
 #include "datacenter_utils.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,16 +17,7 @@ VMType *VMType_exists(DataCenter *dc, const char* type_id){
 	return NULL;
 }
 
-/**
- * Checks if a reservation with the given id already exists in the Data Center.
- * 
- * @param dc Pointer to Data Center.
- * @param reservation_id Id of the reservation being checked.
- * 
- * @return 1 if the reservation exists.
- * @return 0 if the reservation does not exist.
- */	
-static int reservation_exists(DataCenter *dc, const char* reservation_id){
+int reservation_exists(DataCenter *dc, const char* reservation_id){
 	for(size_t i = 0; i < dc->num_reservations; i++){
 		if(strncmp(reservation_id, dc->reservations[i].id, MAX_STRING_SIZE) == 0){
 			return 1;
@@ -133,6 +125,11 @@ int reservation_commit(DataCenter *dc, Reservation *reservation){
 	// Keep track of how many vms existed before.
 	size_t initial_vms = reservation->num_vms;
 
+	char res_dir[MAX_PATH_SIZE];
+	if (join_path(res_dir, sizeof(res_dir), CLOUDIST_TMP_DIR, reservation->id) != 0) {
+		return 1;
+	}
+
 	for (size_t i = 0; i < reservation->items_count; i++) {
 		ReservationItem *item = &reservation->items[i];
 		Server *server = &dc->servers[item->server_id - 1];
@@ -152,9 +149,28 @@ int reservation_commit(DataCenter *dc, Reservation *reservation){
 				reservation->num_vms + 1
 			);
 
+			if (join_path(new_vm->dir_path, sizeof(new_vm->dir_path), res_dir, new_vm->id) != 0) {
+				free(new_vm);
+				reservation_rollback(reservation, initial_vms);
+				return 1;
+			}
+
 			new_vm->type = item->vm_type;
 			new_vm->server = server;
 			new_vm->state = VM_STATE_RESERVED;
+
+			double denom = server->total.cpu * (double)dc->num_servers;
+			double raw_pct = (denom > 0.0)
+				? (100.0 * item->vm_type->required.cpu * (double)dc->host_cores) / denom
+				: 100.0;
+			int max_limit = (int)(100 * dc->host_cores);
+			int cpu_limit = (int)(raw_pct + 0.5);
+			if (cpu_limit < 1) {
+				cpu_limit = 1;
+			} else if (cpu_limit > max_limit) {
+				cpu_limit = max_limit;
+			}
+			new_vm->cpu_limit = cpu_limit;
 
 			resources_sub(&server->available, item->vm_type->required);
 
@@ -238,22 +254,82 @@ void reservation_destroy(DataCenter *dc, Reservation *reservation) {
 	dc->num_reservations--;
 }
 
+static void format_uint_str(unsigned int val, char *buf) {
+	char rev[16];
+	size_t i = 0;
+	if (val == 0) {
+		buf[0] = '0';
+		buf[1] = '\0';
+		return;
+	}
+	while (val > 0 && i < sizeof(rev)) {
+		rev[i++] = (char)('0' + (val % 10U));
+		val /= 10U;
+	}
+	for (size_t j = 0; j < i; j++) {
+		buf[j] = rev[i - 1 - j];
+	}
+	buf[i] = '\0';
+}
+
 void spawn_vm_child(VM *vm) {
-	(void)vm; // To avoid warning.
+	struct rlimit lim;
 
-	// TODO: Limit RAM, DISK and use exec with cpulimit.
+	rlim_t ram_bytes = (rlim_t)vm->type->required.ram << 30;
+	lim.rlim_cur = ram_bytes;
+	lim.rlim_max = ram_bytes;
+	if (setrlimit(RLIMIT_AS, &lim) != 0) {
+		_exit(1);
+	}
 
-	fprintf(stderr, "VM execution not implemented in base version.\n");
+	rlim_t disk_bytes = (rlim_t)vm->type->required.disk << 30;
+	lim.rlim_cur = disk_bytes;
+	lim.rlim_max = disk_bytes;
+	if (setrlimit(RLIMIT_FSIZE, &lim) != 0) {
+		_exit(1);
+	}
+
+	if (vm->dir_path[0] != '\0') {
+		if (chdir(vm->dir_path) != 0) {
+			_exit(1);
+		}
+	}
+
+	unsigned int limit_val = (vm->cpu_limit > 0) ? (unsigned int)vm->cpu_limit : 1U;
+	char limit_str[16];
+	format_uint_str(limit_val, limit_str);
+
+	execlp("cpulimit",
+	       "cpulimit",
+	       "-q",
+	       "-f",
+	       "-l",
+	       limit_str,
+	       "--",
+	       vm->type->exec_path,
+	       (char *)NULL);
+
+	if (errno == ENOENT) {
+		execl(vm->type->exec_path, vm->type->exec_path, (char *)NULL);
+	}
+
+	_exit(1);
 }
 
 int spawn_all_vms(Reservation *res) {
 	for (size_t i = 0; i < res->num_vms; i++) {
 		VM *vm = res->vms[i];
 
-		// TODO: Implement fork code. Set VM PID and update VM state to running.
+		pid_t pid = fork();
+		if (pid < 0) {
+			return 1;
+		}
+		if (pid == 0) {
+			spawn_vm_child(vm);
+		}
 
-		spawn_vm_child(vm);
-
+		vm->pid = pid;
+		vm->state = VM_STATE_RUNNING;
 	}
 
 	return 0;
@@ -261,9 +337,95 @@ int spawn_all_vms(Reservation *res) {
 
 void wait_for_all_vms(Reservation *res) {
 	for (size_t i = 0; i < res->num_vms; i++) {
-		// TODO: IMPLEMENT WAITING FOR VM
-
+		if (res->vms[i]->state == VM_STATE_RUNNING && res->vms[i]->pid > 0) {
+			int status;
+			while (waitpid(res->vms[i]->pid, &status, 0) < 0 && errno == EINTR)
+				;
+		}
 		res->vms[i]->state = VM_STATE_TERMINATED;
+	}
+}
+
+void reap_vm_by_pid(DataCenter *dc, pid_t pid) {
+	if (pid <= 0 || !dc->configured)
+		return;
+
+	int found = 0;
+
+	for (size_t i = 0; i < dc->num_servers; i++) {
+		pthread_mutex_lock(&dc->servers[i].lock);
+	}
+	pthread_mutex_lock(&dc->reservations_lock);
+
+	for (size_t r = 0; r < dc->num_reservations && !found; r++) {
+		Reservation *res = &dc->reservations[r];
+		for (size_t v = 0; v < res->num_vms; v++) {
+			VM *vm = res->vms[v];
+			if (vm != NULL && vm->state == VM_STATE_RUNNING && vm->pid == pid) {
+				Server *server = vm->server;
+
+				resources_add(&server->available, vm->type->required);
+
+				for (size_t j = 0; j < server->num_hosted_vms; j++) {
+					if (server->hosted_vms[j] == vm) {
+						memmove(&server->hosted_vms[j],
+						        &server->hosted_vms[j + 1],
+						        (server->num_hosted_vms - j - 1) * sizeof(VM *));
+						server->num_hosted_vms--;
+						server->hosted_vms[server->num_hosted_vms] = NULL;
+						break;
+					}
+				}
+
+				memmove(&res->vms[v],
+				        &res->vms[v + 1],
+				        (res->num_vms - v - 1) * sizeof(VM *));
+				res->num_vms--;
+				res->vms[res->num_vms] = NULL;
+
+				free(vm);
+
+				if (res->num_vms == 0) {
+					res->state = RES_STATE_FINISHED;
+					memmove(&dc->reservations[r],
+					        &dc->reservations[r + 1],
+					        (dc->num_reservations - r - 1) * sizeof(Reservation));
+					dc->num_reservations--;
+				}
+
+				found = 1;
+				break;
+			}
+		}
+	}
+
+	pthread_mutex_unlock(&dc->reservations_lock);
+	for (size_t i = dc->num_servers; i > 0; i--) {
+		pthread_mutex_unlock(&dc->servers[i - 1].lock);
+	}
+
+	if (found) {
+		pthread_mutex_lock(&dc->reaper_lock);
+		if (dc->active_vms > 0) {
+			dc->active_vms--;
+		}
+		pthread_cond_broadcast(&dc->reaper_cond);
+		pthread_mutex_unlock(&dc->reaper_lock);
+	}
+}
+
+void reap_finished_vms_nonblocking(DataCenter *dc) {
+	if (!dc->configured)
+		return;
+
+	while (1) {
+		int status;
+		pid_t pid = waitpid(-1, &status, WNOHANG);
+		if (pid > 0) {
+			reap_vm_by_pid(dc, pid);
+		} else {
+			break;
+		}
 	}
 }
 

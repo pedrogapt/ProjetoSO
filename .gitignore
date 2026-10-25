@@ -1,7 +1,10 @@
 *.o
-*.so
-*.a
-*.out
-bin/
-build/
+*.txt
+cloudIST
+SO2627-Enunciado-Projecto.pdf
 .vscode/
+*.swp
+*~
+.DS_Store
+public-tests/
+tests-opcionais/
